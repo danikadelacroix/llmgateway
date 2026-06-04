@@ -1,0 +1,24 @@
+# config/gateway_config.yaml
+# llmgateway System Routing Configurations
+
+tiers:
+  primary_fast:
+    model: "groq/llama-3.1-8b-instant" # Updated active model
+    priority: 1
+    timeout: 10
+
+  secondary_reasoning:
+    model: "gemini/gemini-2.0-flash"
+    priority: 2
+    timeout: 15
+
+gateway:
+  default_tier: "primary_fast"
+
+  failover_on:
+    - 429 # Rate Limit Exceeded
+    - 502 # Bad Gateway (Network Down)
+    - 503 # Service Unavailable
+    - 400 # Bad Request (e.g., Decommissioned Model)
+
+  max_retries: 1
