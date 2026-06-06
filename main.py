@@ -2,29 +2,40 @@
 import os
 import json
 import hashlib
+from contextlib import asynccontextmanager
 from fastapi import FastAPI, HTTPException
 from dotenv import load_dotenv
 import litellm
-import redis.asyncio as aioredis  # The async Redis driver
+import redis.asyncio as aioredis
 
 from config_manager import load_config  
+from cache.semantic_cache import SemanticCache
 
 load_dotenv()
-
-app = FastAPI(title="llmgateway", version="0.1.0")
 config = load_config()
 
-# Initialize the persistent connection to your Upstash Cloud Redis
-# decode_responses=True ensures Redis gives us clean Python strings, not raw bytes
-redis_client = aioredis.from_url(os.getenv("REDIS_URL"), decode_responses=True)
+redis_client = None
+semantic_cache = None
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    global redis_client, semantic_cache
+    print("🚀 Booting LLM Gateway...")
+    redis_client = aioredis.from_url(os.getenv("REDIS_URL"), decode_responses=True)
+    semantic_cache = SemanticCache(redis_client)
+    await semantic_cache.hydrate_from_redis()
+    yield 
+    print("🛑 Shutting down Gateway...")
+    await redis_client.close()
+
+app = FastAPI(title="llmgateway", version="0.1.0", lifespan=lifespan)
 
 @app.get("/health")
 async def health():
-    # Quick check to ensure Redis is alive
-    redis_status = await redis_client.ping()
     return {
         "status": "ok", 
-        "redis_connected": redis_status,
+        "redis_connected": await redis_client.ping(),
+        "faiss_vectors_loaded": semantic_cache.index.ntotal if semantic_cache else 0,
         "active_tiers": [name for name, _ in config.ordered_tiers()]
     }
 
@@ -34,76 +45,76 @@ async def proxy(body: dict):
     if not messages:
         raise HTTPException(status_code=400, detail="The 'messages' array cannot be empty.")
 
-    user_requested_model = body.pop("model", None)
+    # FIX 2: Strip the user model. The Gateway dictates routing now.
+    body.pop("model", None) 
 
-    # PHASE 1: THE CACHE INTERCEPTOR
+    # CACHE PRE-PROCESSING
 
-    # 1. Convert the exact messages array into a standardized string
-    prompt_string = json.dumps(messages, sort_keys=True)
+    # FIX 3: Multi-turn structural separators for high-quality embeddings
+    formatted_messages = [f"{m.get('role', 'USER').upper()}: {m.get('content', '')}" for m in messages]
+    text_to_embed = "\n".join(formatted_messages)
     
-    # 2. Crush it into a unique SHA-256 hash ID
-    prompt_hash = hashlib.sha256(prompt_string.encode('utf-8')).hexdigest()
-    cache_key = f"llm_cache:{prompt_hash}"
+    # Generate exact-match ID
+    prompt_hash = hashlib.sha256(json.dumps(messages, sort_keys=True).encode('utf-8')).hexdigest()
+    redis_key = f"llm_cache:{prompt_hash}"
 
-    # 3. Check Redis for this exact key
+    # L1 CACHE: EXACT MATCH (0ms, no math)
     try:
-        cached_data = await redis_client.get(cache_key)
-        if cached_data:
-            print("⚡ CACHE HIT! Returning instant response (0ms network latency).")
-            # Convert the saved JSON string back into a Python dictionary and return it
-            return json.loads(cached_data)
+        # Check if the exact hash exists in Redis and grab the response field
+        exact_data = await redis_client.hget(redis_key, "response")
+        if exact_data:
+            print("⚡ L1 EXACT CACHE HIT! (0ms)")
+            return json.loads(exact_data)
     except Exception as e:
-        print(f"⚠️ Redis read failed: {str(e)} — Bypassing cache.")
+        print(f"⚠️ L1 cache error: {str(e)}")
 
-    # PHASE 2: THE FALLBACK LOOP (Only runs on a Cache Miss)
+    # L2 CACHE: SEMANTIC MATCH (1-5ms FAISS math)
+    try:
+        cached_response = await semantic_cache.search(text_to_embed)
+        if cached_response:
+            # semantic_cache already parses the JSON for us
+            return cached_response
+    except Exception as e:
+        print(f"⚠️ L2 Semantic cache error: {str(e)}")
+
+    # THE FALLBACK LOOP (Network Layer)
 
     last_exception = None
     final_response = None
     
-    if user_requested_model:
+    for tier_name, tier_info in config.ordered_tiers():
         try:
-            final_response = await litellm.acompletion(model=user_requested_model, messages=messages, **body)
+            print(f"🚀 Cache Miss. Routing to: {tier_name} ({tier_info.model})")
+            final_response = await litellm.acompletion(
+                model=tier_info.model,
+                messages=messages,
+                timeout=tier_info.timeout,
+                **body  
+            )
+            break  
+        except litellm.exceptions.APIError as e:
+            status = getattr(e, "status_code", 500)
+            last_exception = e
+            if status in config.gateway.failover_on:
+                print(f"⚠️ {tier_name} failed with {status}. Falling back...")
+                continue 
+            else:
+                raise HTTPException(status_code=status, detail=f"Upstream Error: {str(e)}")
         except Exception as e:
-            raise HTTPException(status_code=500, detail=str(e))
-    else:
-        for tier_name, tier_info in config.ordered_tiers():
-            try:
-                print(f"🚀 Cache Miss. Routing to: {tier_name} ({tier_info.model})")
-                final_response = await litellm.acompletion(
-                    model=tier_info.model,
-                    messages=messages,
-                    timeout=tier_info.timeout,
-                    **body  
-                )
-                break  # Success! Break the loop.
-                
-            except litellm.exceptions.APIError as e:
-                status = getattr(e, "status_code", 500)
-                last_exception = e
-                if status in config.gateway.failover_on:
-                    print(f"⚠️ {tier_name} failed with {status}. Falling back...")
-                    continue 
-                else:
-                    raise HTTPException(status_code=status, detail=f"Upstream Error: {str(e)}")
-            except Exception as e:
-                print(f"⚠️ {tier_name} offline. Falling back...")
-                last_exception = e
-                continue
+            print(f"⚠️ {tier_name} offline. Falling back...")
+            last_exception = e
+            continue
 
     if not final_response:
         raise HTTPException(status_code=502, detail=f"All models failed. Last error: {str(last_exception)}")
 
-    # PHASE 3: SAVE TO CACHE FOR NEXT TIME
-    
+    # WRITE TO L1 & L2 CACHE
     try:
-        # litellm returns a Pydantic object, we convert it to a dictionary, then to a JSON string
-        response_dict = final_response.model_dump()
-        
-        # Save to Redis with an expiration of 24 hours (86400 seconds)
-        # This prevents your cloud database from filling up with old data
-        await redis_client.setex(cache_key, 86400, json.dumps(response_dict))
-        print("💾 Saved new response to Redis cache.")
+        response_json = json.dumps(final_response.model_dump())
+        # This writes the vector to FAISS (L2) and the Hash/JSON to Redis (L1 & L2 backup)
+        await semantic_cache.add(text_to_embed, redis_key, response_json)
+        print("💾 Learned new prompt! Saved to L1 and L2 cache.")
     except Exception as e:
-        print(f"⚠️ Failed to save to Redis: {str(e)}")
+        print(f"⚠️ Failed to save to cache: {str(e)}")
 
     return final_response
