@@ -3,7 +3,8 @@ import os
 import json
 import hashlib
 from contextlib import asynccontextmanager
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Depends
+from dependencies.rate_limiter import token_bucket_limit
 from dotenv import load_dotenv
 import litellm
 import redis.asyncio as aioredis
@@ -39,7 +40,7 @@ async def health():
         "active_tiers": [name for name, _ in config.ordered_tiers()]
     }
 
-@app.post("/v1/chat")
+@app.post("/v1/chat", dependencies=[Depends(token_bucket_limit)])
 async def proxy(body: dict):
     messages = body.pop("messages", [])
     if not messages:
