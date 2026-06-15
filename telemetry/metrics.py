@@ -1,15 +1,46 @@
-# telemetry/metrics.py — Prometheus metrics endpoint
 # telemetry/metrics.py
 import aiosqlite
+from prometheus_client import Counter, Histogram, Gauge, make_asgi_app
 
 DB_PATH = "gateway_logs.db"
 
-async def get_dashboard_metrics() -> dict:
-    """Runs fast SQL aggregations on the raw event stream."""
+# ==========================================
+# PROMETHEUS TIME-SERIES METRICS
+# ==========================================
+requests_total = Counter(
+    "llmgateway_requests_total",
+    "Total requests processed",
+    ["routing"]  # L1_CACHE, L2_CACHE, groq, gemini, error
+)
+
+request_latency_ms = Histogram(
+    "llmgateway_request_latency_ms",
+    "End-to-end request latency in milliseconds",
+    buckets=[10, 25, 50, 100, 250, 500, 1000, 2500, 5000]
+)
+
+faiss_vectors_loaded = Gauge(
+    "llmgateway_faiss_vectors_total",
+    "Number of vectors currently loaded in FAISS index"
+)
+
+tokens_consumed = Counter(
+    "llmgateway_tokens_total",
+    "Total tokens consumed from upstream providers",
+    ["model"]
+)
+
+# Expose the /metrics endpoint in Prometheus text format
+metrics_app = make_asgi_app()
+
+# ==========================================
+# SQLITE ALL-TIME STATS (/stats)
+# ==========================================
+async def get_dashboard_stats() -> dict:
+    """Runs fast SQL aggregations for the all-time /stats snapshot."""
     async with aiosqlite.connect(DB_PATH) as db:
         db.row_factory = aiosqlite.Row
         
-        # 1. Global System Stats
         cursor = await db.execute("""
             SELECT 
                 COUNT(*) as total_requests,
@@ -19,31 +50,16 @@ async def get_dashboard_metrics() -> dict:
             FROM request_logs
         """)
         global_stats = dict(await cursor.fetchone())
-        
-        # Handle empty database edge-case (None -> 0)
         global_stats = {k: (v if v is not None else 0) for k, v in global_stats.items()}
 
-        # 2. Cache Performance (L1 vs L2 vs Miss)
-        cursor = await db.execute("""
-            SELECT cache_hit, COUNT(*) as count 
-            FROM request_logs 
-            GROUP BY cache_hit
-        """)
-        cache_raw = await cursor.fetchall()
-        cache_stats = {row["cache_hit"]: row["count"] for row in cache_raw}
+        cursor = await db.execute("SELECT cache_hit, COUNT(*) as count FROM request_logs GROUP BY cache_hit")
+        cache_stats = {row["cache_hit"]: row["count"] for row in await cursor.fetchall()}
         
-        # Calculate overall Hit Rate percentage
         total = global_stats["total_requests"]
         misses = cache_stats.get("MISS", 0)
-        hits = total - misses
-        hit_rate = round((hits / total * 100), 1) if total > 0 else 0.0
+        hit_rate = round(((total - misses) / total * 100), 1) if total > 0 else 0.0
 
-        # 3. Model Routing Distribution
-        cursor = await db.execute("""
-            SELECT model, COUNT(*) as count 
-            FROM request_logs 
-            GROUP BY model
-        """)
+        cursor = await db.execute("SELECT model, COUNT(*) as count FROM request_logs GROUP BY model")
         model_stats = {row["model"]: row["count"] for row in await cursor.fetchall()}
 
         return {

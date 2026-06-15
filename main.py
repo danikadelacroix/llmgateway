@@ -2,7 +2,7 @@
 import os
 import json
 import hashlib
-import time  #for latency tracking
+import time  # for latency tracking
 from contextlib import asynccontextmanager
 from fastapi import FastAPI, HTTPException, Depends, Request, BackgroundTasks 
 from dependencies.rate_limiter import token_bucket_limit
@@ -10,6 +10,14 @@ from dotenv import load_dotenv
 import litellm
 import redis.asyncio as aioredis
 from telemetry.events import init_events_db, log_event
+from telemetry.metrics import (
+    metrics_app, 
+    get_dashboard_stats, 
+    requests_total, 
+    request_latency_ms, 
+    faiss_vectors_loaded, 
+    tokens_consumed
+)
 
 from config_manager import load_config  
 from cache.semantic_cache import SemanticCache
@@ -17,22 +25,35 @@ from cache.semantic_cache import SemanticCache
 load_dotenv()
 config = load_config()
 
-# redis_client = None
-# semantic_cache = None
-
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     print("🚀 Booting LLM Gateway...")
     app.state.redis = aioredis.from_url(os.getenv("REDIS_URL"), decode_responses=True)
     app.state.semantic_cache = SemanticCache(app.state.redis)
     await app.state.semantic_cache.hydrate_from_redis()
+    faiss_vectors_loaded.set(app.state.semantic_cache.index.ntotal)
     await init_events_db()
+    
+    # Initialize Prometheus Gauge with the current hydrated vector count
+    faiss_vectors_loaded.set(app.state.semantic_cache.index.ntotal)
     yield
     print("🛑 Shutting down...")
     await app.state.redis.close()
 
 app = FastAPI(title="llmgateway", version="0.1.0", lifespan=lifespan)
 
+# 🚨 1. Mount the Prometheus text exporter
+app.mount("/metrics", metrics_app)
+
+# 🚨 2. Mount the SQLite JSON snapshot
+@app.get("/stats")
+async def stats(request: Request):
+    try:
+        data = await get_dashboard_stats()
+        data["memory"] = {"faiss_vectors_loaded": request.app.state.semantic_cache.index.ntotal}
+        return data
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
 
 @app.get("/health")
 async def health(request: Request):
@@ -43,7 +64,6 @@ async def health(request: Request):
         "active_tiers": [name for name, _ in config.ordered_tiers()]
     }
 
-# 🚨 Inject BackgroundTasks and Request into the endpoint
 @app.post("/v1/chat", dependencies=[Depends(token_bucket_limit)])
 async def proxy(body: dict, request: Request, background_tasks: BackgroundTasks):
     start_time = time.time()
@@ -71,10 +91,16 @@ async def proxy(body: dict, request: Request, background_tasks: BackgroundTasks)
             print("⚡ L1 EXACT CACHE HIT! (0ms)")
             latency = (time.time() - start_time) * 1000
             
+            # 🚨 Prometheus Telemetry Update
+            requests_total.labels(routing="L1_CACHE").inc()
+            request_latency_ms.observe(latency)
+            
+            # SQLite Event Log
             background_tasks.add_task(log_event, client_ip, "cache", "L1", latency, 0, 200)
             return json.loads(exact_data)
     except Exception as e:
         print(f"⚠️ L1 cache error: {str(e)}")
+    
 
     # ==========================================
     # L2 CACHE: SEMANTIC MATCH 
@@ -84,6 +110,11 @@ async def proxy(body: dict, request: Request, background_tasks: BackgroundTasks)
         if cached_response:
             latency = (time.time() - start_time) * 1000
             
+            # 🚨 Prometheus Telemetry Update
+            requests_total.labels(routing="L2_CACHE").inc()
+            request_latency_ms.observe(latency)
+            
+            # SQLite Event Log
             background_tasks.add_task(log_event, client_ip, "cache", "L2", latency, 0, 200)
             return cached_response
     except Exception as e:
@@ -120,8 +151,17 @@ async def proxy(body: dict, request: Request, background_tasks: BackgroundTasks)
             last_exception = e
             continue
 
+    # ==========================================
+    # FALLBACK FAILURE (All models failed)
+    # ==========================================
     if not final_response:
         latency = (time.time() - start_time) * 1000
+        
+        # 🚨 Prometheus Telemetry Update
+        requests_total.labels(routing="error").inc()
+        request_latency_ms.observe(latency)
+        
+        # SQLite Event Log
         background_tasks.add_task(log_event, client_ip, "failed", "MISS", latency, 0, 502, str(last_exception))
         raise HTTPException(status_code=502, detail=f"All models failed. Last error: {str(last_exception)}")
 
@@ -132,18 +172,27 @@ async def proxy(body: dict, request: Request, background_tasks: BackgroundTasks)
         response_json = json.dumps(final_response.model_dump())
         await request.app.state.semantic_cache.add(text_to_embed, redis_key, response_json)
         print("New prompt! Saved to L1 and L2 cache.")
+        
+        # 🚨 Sync the live FAISS size Gauge 
+        faiss_vectors_loaded.set(request.app.state.semantic_cache.index.ntotal)
     except Exception as e:
         print(f"⚠️ Failed to save to cache: {str(e)}")
 
     # ==========================================
     # LOG UPSTREAM SUCCESS
     # ==========================================
-    # Safely extract tokens used from the LiteLLM response object
     tokens_used = 0
     if hasattr(final_response, "usage") and final_response.usage:
         tokens_used = getattr(final_response.usage, "total_tokens", 0)
         
     latency = (time.time() - start_time) * 1000
+    
+    # 🚨 Prometheus Telemetry Updates
+    requests_total.labels(routing=successful_model).inc()
+    request_latency_ms.observe(latency)
+    tokens_consumed.labels(model=successful_model).inc(tokens_used)
+    
+    # SQLite Event Log
     background_tasks.add_task(log_event, client_ip, successful_model, "MISS", latency, tokens_used, 200)
 
     return final_response
