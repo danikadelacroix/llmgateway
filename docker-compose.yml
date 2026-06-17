@@ -1,29 +1,34 @@
-version: "3.9"
 services:
-  redis:
-    image: redis:7-alpine
+  gateway:
+    build: .
+    container_name: llmgateway_api
     ports:
-      - "6379:6379"
-
-  postgres:
-    image: postgres:16-alpine
-    environment:
-      POSTGRES_DB: llmgateway
-      POSTGRES_USER: titan
-      POSTGRES_PASSWORD: titan
-    ports:
-      - "5432:5432"
+      - "8000:8000"
+    env_file:
+      - .env
+    volumes:
+      - gateway_data:/app
+    restart: unless-stopped
 
   prometheus:
     image: prom/prometheus:latest
+    container_name: llmgateway_prometheus
     volumes:
       - ./docs/prometheus.yml:/etc/prometheus/prometheus.yml
     ports:
       - "9090:9090"
+    depends_on:
+      - gateway
 
   grafana:
     image: grafana/grafana:latest
+    container_name: llmgateway_grafana
     ports:
       - "3000:3000"
+    environment:
+      - GF_SECURITY_ADMIN_PASSWORD=admin
     depends_on:
       - prometheus
+
+volumes:
+  gateway_data:
