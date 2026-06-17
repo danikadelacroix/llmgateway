@@ -1,7 +1,3 @@
-how is this, now I should put both these files on github as well right?
-
-# config/config_manager.py
-
 import yaml
 
 from pydantic import BaseModel, Field
