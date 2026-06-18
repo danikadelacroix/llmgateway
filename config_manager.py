@@ -1,16 +1,6 @@
-how is this, now I should put both these files on github as well right?
-
-# config/config_manager.py
-
 import yaml
-
 from pydantic import BaseModel, Field
-
 from typing import Dict, List
-
-
-
-
 
 class TierConfig(BaseModel):
 
@@ -21,9 +11,6 @@ class TierConfig(BaseModel):
     timeout: int = Field(default=30)
 
 
-
-
-
 class GatewayRules(BaseModel):
 
     default_tier: str
@@ -32,27 +19,17 @@ class GatewayRules(BaseModel):
 
     max_retries: int
 
-
-
-
-
 class AppConfig(BaseModel):
 
     tiers: Dict[str, TierConfig]
 
     gateway: GatewayRules
 
-
-
     def ordered_tiers(self) -> List[tuple]:
 
         """Returns tiers sorted by priority — main.py calls this, not raw dict."""
 
         return sorted(self.tiers.items(), key=lambda x: x[1].priority)
-
-
-
-
 
 def load_config(yaml_path: str = "config/gateway_config.yaml") -> AppConfig:
 
@@ -64,20 +41,13 @@ def load_config(yaml_path: str = "config/gateway_config.yaml") -> AppConfig:
 
         return AppConfig(**raw)
 
-
-
     except FileNotFoundError:
 
         raise RuntimeError(f"CRITICAL: Missing config at '{yaml_path}'. Gateway cannot start.")
 
-
-
     except Exception as e:
 
         raise RuntimeError(f"CRITICAL: Invalid config — {str(e)}")
-
-
-
 
 
 if __name__ == "__main__":
