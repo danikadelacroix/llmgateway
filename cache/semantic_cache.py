@@ -12,7 +12,7 @@ class SemanticCache:
         self.redis = redis_client
 
         print("⏳ Loading BGE-small model via fastembed...")
-        self.model = TextEmbedding(model_name="BAAI/bge-small-en-v1.5")
+        self.model = TextEmbedding(model_name="BAAI/bge-small-en-v1.5", threads=1)
 
         self.index = faiss.IndexFlatIP(self.dimension)
         self.id_to_redis_key = {}

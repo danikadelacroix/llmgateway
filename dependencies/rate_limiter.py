@@ -2,8 +2,8 @@
 import time
 from fastapi import Request, HTTPException
 
-CAPACITY = 10
-REFILL_RATE = 2.0  # tokens per second
+CAPACITY=5000
+REFILL_RATE=1000
 
 # Executes atomically on Redis — no race conditions under horizontal scaling
 LUA_SCRIPT = """
