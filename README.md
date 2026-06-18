@@ -1,228 +1,137 @@
 # llmgateway
 
-> A production-grade reverse proxy and traffic optimization gateway for LLM infrastructure. Built from first principles — no managed wrappers, no shortcuts.
+**High-availability reverse proxy and traffic optimization gateway for LLM infrastructure.**
 
----
-
-## What it does
-
-Most applications talk directly to LLM providers. That means every duplicate question costs a full API call, one bad upstream response crashes the user's app, and you have zero visibility into what your inference layer is actually doing.
-
-`llmgateway` sits between your application and your LLM providers and fixes all three:
-
-- **Semantic cache** — two differently-worded questions with the same meaning return the same cached response. No upstream call, no cost.
-- **Automatic failover** — if Groq throws a 429, the gateway silently reroutes to Gemini. The user sees nothing.
-- **Distributed rate limiting** — token bucket enforced at the Redis layer, safe under horizontal scaling. All containers share one state.
-- **Full observability** — every request emits a structured event: latency, routing decision, token count, cache hit/miss, status code.
-
----
-
-## How it's different from Nginx
-
-|               | Nginx              | llmgateway                                        |
-| ------------- | ------------------ | ------------------------------------------------- |
-| Routes by     | URL / headers      | Payload semantics + cost                          |
-| Cache key     | Exact URL          | Embedding vector (cosine similarity)              |
-| Routing logic | Static config file | Priority-ordered YAML, runtime failover           |
-| Rate limiting | Per-server memory  | Distributed Redis Lua script, atomic              |
-| Observability | Access logs        | Structured events → SQLite → Prometheus → Grafana |
+Intercepts, inspects, and dynamically routes payloads across distributed upstream endpoints with semantic caching, cost-aware routing, and real-time observability.
 
 ---
 
 ## Architecture
 
 ```
-                        ┌──────────────────────────────────────────┐
-                        │              llmgateway                   │
-                        │                                          │
-  HTTP POST /v1/chat ──►│  1. Token Bucket (Redis Lua, atomic)     │
-                        │            │                             │
-                        │  2. L1 Cache: SHA-256 exact match        │
-                        │            │ miss                        │
-                        │  3. L2 Cache: FAISS cosine similarity    │──► Response
-                        │            │ miss                        │
-                        │  4. Traffic Router (YAML priority order) │
-                        │            │                             │
-                        │  5. Async upstream call + failover       │
-                        │            │                             │
-                        │  6. Write to L1 + L2 cache              │
-                        │            │                             │
-                        │  7. Emit telemetry event (background)    │
-                        └──────────────────────────────────────────┘
-                                     │
-                    ┌────────────────┼─────────────────┐
-                    ▼                ▼                  ▼
-               Groq API        Gemini API          [next tier]
-                                     │
-                    ┌────────────────┘
-                    ▼
-          SQLite (request_logs)
-                    │
-                    ▼
-          Prometheus /metrics
-                    │
-                    ▼
-          Grafana dashboard
+Client Request
+      │
+      ▼
+┌─────────────────────────────────────────┐
+│           llmgateway Gateway            │
+│                                         │
+│  Redis Token Bucket Limiter(Lua)        │
+│         │                               │
+│  L1 Redis Hash Cache ──── hit ─────────►│── Response(<50ms)
+│         │ miss                          │
+│  L2 FAISS Semantic Cache ───── hit ────►│── Response (<200ms)
+│         │ miss                          │
+│  Cost-Aware Traffic Router              │
+│         │                               │
+│  Async Connection Pool                  │
+│         │                               │
+│  Telemetry Event Pipeline               │
+└─────────────────────────────────────────┘
+      │
+      ▼
+Upstream Endpoints (Groq / Gemini)
+      │
+      ▼
+Prometheus /metrics ──► Grafana Dashboard
 ```
 
----
+## What makes this different from a standard proxy
+
+| Feature       | Standard Proxy     | llmgateway                                        |
+| ------------- | ------------------ | ------------------------------------------------- |
+| Routes by     | URL / headers      | Payload semantics + cost                          |
+| Cache key     | URL string         | Embedding vector (cosine similarity)              |
+| Routing logic | Static config      | Priority-ordered with failover                    |
+| Rate limiting | Middleware counter | Atomic Redis Lua token bucket                     |
+| Observability | Access logs        | p95/p99 latency, token burn rate, cache hit ratio |
 
 ## Stack
 
-| Layer                | Technology             | Why                                                 |
-| -------------------- | ---------------------- | --------------------------------------------------- |
-| Gateway              | FastAPI + asyncio      | Non-blocking I/O throughout                         |
-| Provider abstraction | LiteLLM                | Normalises Groq/Gemini API schemas                  |
-| L1 Cache             | Redis (Upstash)        | Exact match, 0ms lookup                             |
-| L2 Cache             | FAISS + fastembed      | Semantic similarity, ONNX — no PyTorch bloat        |
-| Embeddings           | BGE-small-en-v1.5      | 384-dim, fast, no GPU required                      |
-| Rate limiter         | Redis Lua script       | Atomic token bucket, horizontally safe              |
-| Config               | Pydantic + YAML        | Validated schema, operator-configurable             |
-| Telemetry            | aiosqlite + Prometheus | Non-blocking background writes                      |
-| Observability        | Grafana                | p50/p95/p99 latency, cache hit ratio, routing split |
+- **Gateway:** FastAPI + asyncio + httpx
+- **Rate limiting:** Custom token bucket via Redis Lua scripting (atomic, race-condition safe)
+- **Cache:** Two-layer — L1 Redis exact hash match → L2 FAISS semantic similarity (BGE-small via fastembed)
+- **Telemetry:** Prometheus (real-time metrics) + SQLite WAL (all-time event log)
+- **Observability:** Grafana dashboard with 5 panels
+- **Inference:** LiteLLM routing to Groq LLaMA 3.1 (primary) and Gemini 2.0 Flash (failover)
 
----
+## Caching Architecture
 
-## Caching strategy
+Requests flow through two cache layers before hitting any upstream model:
 
-The two-layer cache is the core engineering contribution of this project.
+**L1 — Exact Match (Redis hash)**
+SHA-256 hash of the serialized message array. Sub-millisecond lookup. Zero network cost.
 
-**L1 — Exact match (SHA-256 hash)**
-Identical requests return instantly. Lookup is a single Redis `HGET` — effectively 0ms.
+**L2 — Semantic Match (FAISS + fastembed)**
+BGE-small-en-v1.5 embeds the prompt into a 384-dimension vector. FAISS searches for the nearest cached vector using cosine similarity. Hits at ≥0.85 similarity score return the cached response without touching any upstream API.
 
-**L2 — Semantic match (FAISS + BGE embeddings)**
-Similar requests with different wording hit the same cached response. Uses cosine similarity with a configurable threshold (default 0.85).
-
-```
-"How do I reverse a string in Python?"
-"What's the way to flip a string in Python?"
-→ Semantic score: 0.896 → L2 cache hit
-```
-
-Benchmark against hash-only caching on 1,000 requests with natural language variation:
-
-| Cache strategy   | Hit rate |
-| ---------------- | -------- |
-| L1 hash only     | ~4%      |
-| L1 + L2 semantic | ~34%     |
-
-**FAISS persistence across restarts** — vectors are serialized to Redis alongside responses. On startup, `hydrate_from_redis()` rebuilds the FAISS index in memory. No cold start problem, no persistent volume needed.
-
----
-
-## Rate limiting
-
-Custom token bucket implemented as a Redis Lua script — no library, no middleware.
-
-```
-CAPACITY    = 10 tokens   (max burst)
-REFILL_RATE = 2.0/sec     (sustained throughput)
-```
-
-Lua executes atomically on the Redis server. Two containers serving the same client IP cannot both read `tokens=1` and both succeed — the race condition that breaks in-memory rate limiters at scale is eliminated.
-
-Applied as a FastAPI `Depends` on `/v1/chat` only. Health check endpoints are never rate limited — load balancers and Kubernetes liveness probes work unaffected.
-
----
-
-## Failover
-
-Upstreams are defined in `config/gateway_config.yaml` with priority order and failover trigger codes. No code changes needed to add or reorder providers.
-
-```yaml
-tiers:
-  primary_fast:
-    model: "groq/llama-3.1-8b-instant"
-    priority: 1
-    timeout: 10
-
-  secondary_reasoning:
-    model: "gemini/gemini-2.5-flash"
-    priority: 2
-    timeout: 15
-
-gateway:
-  failover_on: [429, 502, 503, 400]
-```
-
-On a 429 from Groq, the gateway silently retries on Gemini. The client receives a 200. The failover is invisible.
-
----
+New responses are written to both layers simultaneously. L2 vectors persist across restarts via Redis hydration on boot.
 
 ## Quick start
-
+Set up your environment and point `REDIS_URL` to an active Redis instance (like Upstash Cloud or a local Docker container)
 ```bash
-git clone https://github.com/danikadelacroix/llmgateway
-cd llmgateway
-
-cp .env.example .env
-# fill in GROQ_API_KEY and GEMINI_API_KEY
-
-pip install -r requirements.txt
-uvicorn main:app --reload
+cp .env.example .env          # fill in API keys
+docker-compose up -d          # starts gateway, Prometheus, Grafana
 ```
 
-Test the proxy:
+Hit the proxy:
 ```bash
 curl -X POST http://localhost:8000/v1/chat \
   -H "Content-Type: application/json" \
-  -d '{"messages": [{"role": "user", "content": "hello"}]}'
+  -d '{"model": "auto", "messages": [{"role": "user", "content": "hello"}]}'
 ```
 
-Swagger UI: `http://localhost:8000/docs`
+Endpoints:
+- `POST /v1/chat` — main proxy endpoint
+- `GET /health` — container health + FAISS vector count
+- `GET /stats` — all-time SQLite aggregates (hit rate, token usage, model routing)
+- `GET /metrics` — Prometheus scrape endpoint
 
-Start observability stack:
-```bash
-docker-compose up -d   # Redis + Prometheus + Grafana
-```
-
-Grafana: `http://localhost:3000`
-
----
-
-## Project structure
-
-```
-llmgateway/
-├── main.py                      # Gateway entry point, request pipeline
-├── config/
-│   ├── gateway_config.yaml      # Upstream tiers, failover rules
-│   └── config_manager.py        # Pydantic schema + loader
-├── cache/
-│   └── semantic_cache.py        # L1 + L2 cache, FAISS hydration
-├── dependencies/
-│   └── rate_limiter.py          # Token bucket, Redis Lua script
-├── telemetry/
-│   ├── events.py                # RequestEvent dataclass + aiosqlite writer
-│   └── metrics.py               # Prometheus counters and histograms
-├── scripts/
-│   ├── benchmark.py             # Latency benchmark — prints p50/p95/p99
-│   └── load_test.py             # Locust load test (100/500/1000 users)
-└── docs/
-    └── prometheus.yml           # Scrape config
-```
-
----
+Grafana dashboard: `http://localhost:3000`
 
 ## Benchmarks
 
-> Run `python scripts/benchmark.py` to populate
+Run against a warm cache (semantic duplicates pre-seeded). All 100 requests succeed at each tier with zero upstream model calls after the warmup phase.
 
-| Concurrent users | p50 | p95 | p99 | Cache hit ratio |
-| ---------------- | --- | --- | --- | --------------- |
-| 100              | —   | —   | —   | —               |
-| 500              | —   | —   | —   | —               |
-| 1000             | —   | —   | —   | —               |
+```bash
+python scripts/benchmark.py
+```
 
----
+| Concurrent users | p50   | p95    | p99    | Cache hit ratio |
+| ---------------- | ----- | ------ | ------ | --------------- |
+| 10               | 110ms | 157ms  | 407ms  | ~100%           |
+| 50               | 328ms | 1125ms | 1547ms | ~100%           |
+| 100              | 359ms | 672ms  | 734ms  | ~100%           |
+
+> p99 at concurrency 100 outperforms concurrency 50 because the FAISS embedding thread (capped at 1 to prevent OOM under Docker) serializes the initial concurrent wave more evenly than the 50-user burst pattern. Overall production hit rate across mixed traffic: **91.5%** (from `/stats` across 171 requests).
+
+## Observability
+
+Grafana panels:
+
+| Panel                    | Query                                                                                                    |
+| ------------------------ | -------------------------------------------------------------------------------------------------------- |
+| Requests by routing      | `sum by (routing) (llmgateway_requests_total)`                                                           |
+| p99 latency (ms)         | `histogram_quantile(0.99, sum(rate(llmgateway_request_latency_ms_bucket[5m])) by (le))`                  |
+| Cache hit rate %         | `(sum(llmgateway_requests_total{routing=~"L1_CACHE\|L2_CACHE"}) / sum(llmgateway_requests_total)) * 100` |
+| FAISS vectors loaded     | `llmgateway_faiss_vectors_total`                                                                         |
+| Token burn rate by model | `sum(increase(llmgateway_tokens_total[$__rate_interval])) by (model)`                                    |
+
+Import `docs/grafana_dashboard.json` to restore the full dashboard instantly.
 
 ## Environment variables
 
-| Variable                     | Description                                |
-| ---------------------------- | ------------------------------------------ |
-| `GROQ_API_KEY`               | Groq API key                               |
-| `GEMINI_API_KEY`             | Google Gemini API key                      |
-| `REDIS_URL`                  | Redis connection URL (Upstash recommended) |
-| `RATE_LIMIT_CAPACITY`        | Token bucket max burst (default: 10)       |
-| `RATE_LIMIT_REFILL_RATE`     | Tokens per second (default: 2.0)           |
-| `CACHE_SIMILARITY_THRESHOLD` | Cosine similarity cutoff (default: 0.85)   |
+```bash
+# .env.example
+GROQ_API_KEY=your_key_here
+GEMINI_API_KEY=your_key_here
+REDIS_URL=redis://localhost:6379      # or Upstash cloud URL
+RATE_LIMIT_CAPACITY=5000
+RATE_LIMIT_REFILL_RATE=1000
+```
+
+## Core Learnings
+This infrastructure was built to solve the specific bottlenecks of AI development: expensive API calls and unpredictable tail latencies. By constraining the C++ embedding threads and isolating the SQLite WAL volumes, the event loop remains entirely unblocked under heavy concurrent loads.
+
+---
+**Author:** Anushka Rajput
+*Built to handle production concurrency without choking.*
