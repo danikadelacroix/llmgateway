@@ -1,13 +1,13 @@
 services:
   gateway:
     build: .
-    container_name: llmgateway_api
+    container_name: llmgateway_gateway
     ports:
       - "8000:8000"
     env_file:
       - .env
     volumes:
-      - gateway_data:/app
+      - gateway_data:/data
     restart: unless-stopped
 
   prometheus:
@@ -15,6 +15,7 @@ services:
     container_name: llmgateway_prometheus
     volumes:
       - ./docs/prometheus.yml:/etc/prometheus/prometheus.yml
+      - prometheus_data:/prometheus
     ports:
       - "9090:9090"
     depends_on:
@@ -23,6 +24,8 @@ services:
   grafana:
     image: grafana/grafana:latest
     container_name: llmgateway_grafana
+    volumes:
+      - grafana_data:/var/lib/grafana
     ports:
       - "3000:3000"
     environment:
@@ -32,3 +35,5 @@ services:
 
 volumes:
   gateway_data:
+  prometheus_data:
+  grafana_data:
