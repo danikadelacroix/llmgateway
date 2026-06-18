@@ -1,7 +1,7 @@
 # telemetry/events.py
 import aiosqlite
 
-DB_PATH = "gateway_logs.db"
+DB_PATH = "/data/gateway_logs.db"
 
 async def init_events_db():
     """Creates the SQLite telemetry database and enables high-concurrency mode."""

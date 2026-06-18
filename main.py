@@ -28,10 +28,10 @@ config = load_config()
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     print("🚀 Booting LLM Gateway...")
+    os.makedirs("data", exist_ok=True)
     app.state.redis = aioredis.from_url(os.getenv("REDIS_URL"), decode_responses=True)
     app.state.semantic_cache = SemanticCache(app.state.redis)
     await app.state.semantic_cache.hydrate_from_redis()
-    faiss_vectors_loaded.set(app.state.semantic_cache.index.ntotal)
     await init_events_db()
     
     # Initialize Prometheus Gauge with the current hydrated vector count

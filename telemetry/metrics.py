@@ -2,7 +2,7 @@
 import aiosqlite
 from prometheus_client import Counter, Histogram, Gauge, make_asgi_app
 
-DB_PATH = "gateway_logs.db"
+DB_PATH = "/data/gateway_logs.db"
 
 # ==========================================
 # PROMETHEUS TIME-SERIES METRICS
