@@ -1,12 +1,20 @@
 # llmgateway
 
-**High-availability reverse proxy and traffic optimization gateway for LLM infrastructure.**
+**Production-ready LLM gateway with semantic caching, intelligent routing, provider failover, rate limiting, and live AWS deployment.**
 
-Intercepts, inspects, and dynamically routes payloads across distributed upstream endpoints with semantic caching, cost-aware routing, and real-time observability.
+> 🚀 **Live Demo (Swagger):** http://35.154.90.4:8000/docs
+> 🟢 **Health Endpoint:** http://35.154.90.4:8000/health
+>
+> ☁️ **Deployment:** AWS EC2 · Docker · Upstash Redis
+> 🧠 **Core Technologies:** FastAPI · LiteLLM · FAISS · fastembed · Redis Lua
+>
+> 🚧 **Interactive Gradio chat interface with live gateway insights is under development.**
 
 ---
 
 ## Architecture
+
+Requests first traverse an atomic Redis token bucket, then an exact-match Redis cache, followed by a semantic FAISS cache before being routed to the highest-priority available LLM provider, minimizing latency and upstream API usage.
 
 ```
 Client Request
@@ -35,117 +43,186 @@ Upstream Endpoints (Groq / Gemini)
 Prometheus /metrics ──► Grafana Dashboard
 ```
 
-## What makes this different from a standard proxy
+---
 
-| Feature       | Standard Proxy     | llmgateway                                   |
-| ------------- | ------------------ | -------------------------------------------- |
-| Routes by     | URL / headers      | Payload semantics + cost                     |
-| Cache key     | URL string         | Embedding vector (cosine similarity)         |
-| Routing logic | Static config      | Priority-ordered with failover               |
-| Rate limiting | Middleware counter | Atomic Redis Lua token bucket                |
-| Observability | Access logs        | p95/p99 latency, token burn rate, cache hits |
+## Why llmgateway?
 
-## Stack
+| Feature       | Standard Proxy     | llmgateway                                    |
+| ------------- | ------------------ | --------------------------------------------- |
+| Routes by     | URL / headers      | Payload semantics + cost                      |
+| Cache key     | URL string         | Embedding vector (cosine similarity)          |
+| Routing logic | Static config      | Priority-ordered with automatic failover      |
+| Rate limiting | Middleware counter | Atomic Redis Lua token bucket                 |
+| Observability | Access logs        | p95/p99 latency, token burn, cache statistics |
 
-- **Gateway:** FastAPI + asyncio + httpx
-- **Rate limiting:** Custom token bucket via Redis Lua scripting (atomic, race-condition safe)
-- **Cache:** Two-layer — L1 Redis exact hash match → L2 FAISS semantic similarity (BGE-small via fastembed)
-- **Telemetry:** Prometheus (real-time metrics) + SQLite WAL (all-time event log)
-- **Observability:** Grafana dashboard with 5 panels
-- **Inference:** LiteLLM routing to Groq LLaMA 3.1 (primary) and Gemini 2.0 Flash (failover)
+---
+
+## Technology Stack
+
+### Backend
+- **FastAPI**
+- **asyncio**
+- **httpx**
+- **LiteLLM**
+
+### Infrastructure
+- **Docker**
+- **AWS EC2**
+- **Upstash Redis**
+- **FAISS**
+- **fastembed (BGE-small-en-v1.5)**
+
+### Reliability
+- Priority-based provider failover (Groq → Gemini)
+- Dual-layer semantic cache (Redis + FAISS)
+- Atomic Redis Lua token-bucket rate limiting
+
+### Observability
+- Prometheus
+- Grafana
+- SQLite WAL telemetry
+
+---
 
 ## Caching Architecture
 
-Requests flow through two cache layers before hitting any upstream model:
+Requests flow through two cache layers before hitting any upstream model.
 
-**L1 — Exact Match (Redis hash)**
-SHA-256 hash of the serialized message array. Sub-millisecond lookup. Zero compute cost.
+### L1 — Exact Match (Redis)
 
-**L2 — Semantic Match (FAISS + fastembed)**
-BGE-small-en-v1.5 embeds the prompt into a 384-dimension vector. FAISS searches for the nearest cached vector using cosine similarity. Hits at ≥0.85 similarity score return the cached response without touching any upstream API.
+A SHA-256 hash of the serialized message array is used as the cache key. Exact matches are served directly from Redis in sub-millisecond time with zero compute cost.
 
-New responses are written to both layers simultaneously. L2 vectors persist across restarts via Redis hydration on boot.
+### L2 — Semantic Match (FAISS + fastembed)
 
-## Quick Start
+BGE-small-en-v1.5 embeds each prompt into a 384-dimensional vector. FAISS performs cosine similarity search against previously cached requests. Queries with a similarity score ≥ **0.85** return the cached response without contacting any upstream LLM.
 
-Set up your environment and point `REDIS_URL` to an active Redis instance (Upstash Cloud or a local Docker container).
+New responses are written to both cache layers simultaneously. FAISS vectors are restored from Redis during startup, allowing semantic cache persistence across container restarts.
+
+---
+
+## Local Development
 
 ```bash
-cp .env.example .env          # fill in API keys
-docker-compose up -d          # starts gateway, Prometheus, Grafana
+git clone https://github.com/danikadelacroix/llmgateway.git
+cd llmgateway
+
+cp .env.example .env
+# Fill in your API keys
+
+docker compose up -d
 ```
 
-Hit the proxy:
+The development compose starts:
+- Gateway
+- Prometheus
+- Grafana
+
+---
+
+## Production Deployment
+
+```bash
+cp .env.example .env
+# Configure Upstash Redis + API keys
+
+docker compose -f docker-compose.prod.yml up -d
+```
+
+---
+
+## API Usage
 
 ```bash
 curl -X POST http://localhost:8000/v1/chat \
   -H "Content-Type: application/json" \
-  -d '{"model": "auto", "messages": [{"role": "user", "content": "hello"}]}'
+  -d '{
+    "model": "auto",
+    "messages": [
+      {
+        "role": "user",
+        "content": "hello"
+      }
+    ]
+  }'
 ```
 
-Endpoints:
+Available endpoints:
 
-- `POST /v1/chat` — main proxy endpoint
-- `GET /health` — container health + FAISS vector count
-- `GET /stats` — all-time SQLite aggregates (token usage, model routing)
-- `GET /metrics` — Prometheus scrape endpoint
+- `POST /v1/chat` — OpenAI-compatible chat completion endpoint
+- `GET /health` — Health check + FAISS vector count
+- `GET /stats` — SQLite telemetry aggregates
+- `GET /metrics` — Prometheus metrics
 
-Grafana dashboard: `http://localhost:3000`
+---
 
 ## Benchmarks
 
-Run against a warm cache (semantic duplicates pre-seeded). All 100 requests succeed at each concurrency tier with zero upstream model calls after the warmup phase.
+Run against a warm semantic cache:
 
 ```bash
 python scripts/benchmark.py
 ```
 
-| Concurrent users | p50   | p95    | p99    |
-| ---------------- | ----- | ------ | ------ |
-| 10               | 110ms | 157ms  | 407ms  |
-| 50               | 328ms | 1125ms | 1547ms |
-| 100              | 359ms | 672ms  | 734ms  |
+| Concurrent Users | p50    | p95     | p99     |
+| ---------------- | ------ | ------- | ------- |
+| 10               | 110 ms | 157 ms  | 407 ms  |
+| 50               | 328 ms | 1125 ms | 1547 ms |
+| 100              | 359 ms | 672 ms  | 734 ms  |
 
-> p99 at concurrency 100 outperforms concurrency 50 because the FAISS embedding thread (capped at 1 to prevent OOM under Docker) serializes the initial concurrent wave more evenly than the 50-user burst pattern.
+> p99 latency at 100 concurrent users outperformed the 50-user run because constraining ONNX embedding threads to one produced a smoother request distribution during the initial cache warm-up phase.
+
+---
 
 ## System Characteristics
 
-Performance properties derived from architecture and load testing, independent of prompt distribution.
+| Property                  | Value                                        |
+| ------------------------- | -------------------------------------------- |
+| L1 Cache Latency          | <50 ms                                       |
+| L2 Semantic Cache Latency | <200 ms                                      |
+| Upstream LLM Latency      | 500–2000 ms                                  |
+| Cache Speedup             | 10–40× (L1), 2.5–10× (L2)                    |
+| FAISS Search (1k vectors) | <0.1 ms                                      |
+| Similarity Threshold      | 0.85                                         |
+| Rate Limiter              | 5,000 token capacity, 1,000 token/sec refill |
 
-| Property                      | Value                                                     |
-| ----------------------------- | --------------------------------------------------------- |
-| L1 response latency           | <50ms (Redis HGET, zero compute)                          |
-| L2 response latency           | <200ms (BGE-small embed + FAISS search + Redis HGET)      |
-| Upstream LLM latency (Groq)   | 500–2000ms                                                |
-| Cache speedup vs upstream     | 10–40x (L1), 2.5–10x (L2)                                 |
-| L2 FAISS search at 1k vectors | <0.1ms (IndexFlatIP exhaustive, C++ backend)              |
-| Redis memory per cached entry | ~2.8 KB (1.5KB vector + response JSON + key overhead)     |
-| Base64 expansion overhead     | 1.33x (1.5KB raw float32 → 2.0KB stored)                  |
-| At 10k cached entries         | ~27MB Redis memory                                        |
-| FAISS embedding threads       | 1 (capped to prevent Docker OOM under concurrent load)    |
-| Cosine similarity threshold   | 0.85 (BGE-small-en-v1.5, 384-dim vectors)                 |
-| Rate limit                    | 5,000 token capacity, 1,000/s refill (atomic Lua, per-IP) |
+---
 
 ## Observability
 
-Import `docs/grafana_dashboard.json` to restore the full dashboard instantly.
+The gateway exposes Prometheus metrics for:
+- Request throughput
+- p95 / p99 latency
+- Token consumption
+- Cache hit ratio
+- Provider routing
+
+Import `docs/grafana_dashboard.json` to restore the complete dashboard.
+
+---
 
 ## Environment Variables
 
 ```bash
-# .env.example
 GROQ_API_KEY=your_key_here
 GEMINI_API_KEY=your_key_here
-REDIS_URL=redis://localhost:6379      # or Upstash cloud URL
+
+# Local Redis or Upstash
+REDIS_URL=rediss://<upstash-url>
+
 RATE_LIMIT_CAPACITY=5000
 RATE_LIMIT_REFILL_RATE=1000
 ```
 
-## Core Learnings
+---
 
-This infrastructure was built to solve the specific bottlenecks of AI development: expensive API calls and unpredictable tail latencies. By constraining the C++ embedding threads and isolating the SQLite WAL volumes, the event loop remains entirely unblocked under heavy concurrent loads.
+## Roadmap
+
+- Interactive Gradio chat interface
+- Live gateway insights (cache hit/miss, provider, latency, similarity score)
+- HTTPS (Let's Encrypt) and optional custom domain
+- Support for additional LLM providers
 
 ---
 
 **Author:** Anushka Rajput  
-*Built to handle production concurrency without choking.*
+*Built to optimize LLM infrastructure.*
