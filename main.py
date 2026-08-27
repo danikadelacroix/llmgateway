@@ -6,6 +6,7 @@ import time  # for latency tracking
 from contextlib import asynccontextmanager
 from fastapi import FastAPI, HTTPException, Depends, Request, BackgroundTasks 
 from dependencies.rate_limiter import token_bucket_limit
+from dependencies.budget_gate import enforce_budget
 from dotenv import load_dotenv
 import litellm
 import redis.asyncio as aioredis
@@ -64,7 +65,7 @@ async def health(request: Request):
         "active_tiers": [name for name, _ in config.ordered_tiers()]
     }
 
-@app.post("/v1/chat", dependencies=[Depends(token_bucket_limit)])
+@app.post("/v1/chat", dependencies=[Depends(enforce_budget)])
 async def proxy(body: dict, request: Request, background_tasks: BackgroundTasks):
     start_time = time.time()
     client_ip = request.client.host

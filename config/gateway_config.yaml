@@ -1,5 +1,6 @@
 # config/gateway_config.yaml
-# llmgateway System Routing Configurations
+# Defines upstream providers, priority order, and failover chain
+# The gateway reads this at startup — no code changes needed to swap providers
 
 tiers:
   primary_fast:
@@ -8,7 +9,7 @@ tiers:
     timeout: 10
 
   secondary_reasoning:
-    model: "gemini/gemini-2.0-flash"
+    model: "gemini/gemini-2.5-flash"
     priority: 2
     timeout: 15
 
