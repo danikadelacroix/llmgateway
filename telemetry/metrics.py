@@ -36,6 +36,13 @@ budget_rejections_total = Counter(
     "Total requests rejected by the budget guardrail (HTTP 402)"
 )
 
+# 🚨 New: track cache bypasses
+cache_bypasses_total = Counter(
+    "llmgateway_cache_bypasses_total",
+    "Requests that bypassed the cache due to query class",
+    ["query_class"]
+)
+
 # Expose the /metrics endpoint in Prometheus text format
 metrics_app = make_asgi_app()
 

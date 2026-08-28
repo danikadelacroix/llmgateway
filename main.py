@@ -17,11 +17,14 @@ from telemetry.metrics import (
     requests_total, 
     request_latency_ms, 
     faiss_vectors_loaded, 
-    tokens_consumed
+    tokens_consumed,
+    budget_rejections_total,  # noqa: F401 — ensures counter is registered before /metrics mounts
+    cache_bypasses_total,
 )
 
 from config_manager import load_config  
 from cache.semantic_cache import SemanticCache
+from cache.cacheability import classify, DEFAULT_POLICY
 
 load_dotenv()
 config = load_config()
@@ -83,43 +86,50 @@ async def proxy(body: dict, request: Request, background_tasks: BackgroundTasks)
     prompt_hash = hashlib.sha256(json.dumps(messages, sort_keys=True).encode('utf-8')).hexdigest()
     redis_key = f"llm_cache:{prompt_hash}"
 
-    # ==========================================
-    # L1 CACHE: EXACT MATCH
-    # ==========================================
-    try:
-        exact_data = await request.app.state.redis.hget(redis_key, "response")
-        if exact_data:
-            print("⚡ L1 EXACT CACHE HIT! (0ms)")
-            latency = (time.time() - start_time) * 1000
-            
-            # 🚨 Prometheus Telemetry Update
-            requests_total.labels(routing="L1_CACHE").inc()
-            request_latency_ms.observe(latency)
-            
-            # SQLite Event Log
-            background_tasks.add_task(log_event, client_ip, "cache", "L1", latency, 0, 200)
-            return json.loads(exact_data)
-    except Exception as e:
-        print(f"⚠️ L1 cache error: {str(e)}")
-    
+    query_class = classify(messages)
+    is_cacheable = query_class.is_cacheable
 
-    # ==========================================
-    # L2 CACHE: SEMANTIC MATCH 
-    # ==========================================
-    try:
-        cached_response = await request.app.state.semantic_cache.search(text_to_embed)
-        if cached_response:
-            latency = (time.time() - start_time) * 1000
-            
-            # 🚨 Prometheus Telemetry Update
-            requests_total.labels(routing="L2_CACHE").inc()
-            request_latency_ms.observe(latency)
-            
-            # SQLite Event Log
-            background_tasks.add_task(log_event, client_ip, "cache", "L2", latency, 0, 200)
-            return cached_response
-    except Exception as e:
-        print(f"⚠️ L2 Semantic cache error: {str(e)}")
+    if not is_cacheable:
+        cache_bypasses_total.labels(query_class=query_class.value).inc()
+        print(f"Bypassing cache (Class: {query_class.value})")
+    else:
+        # ==========================================
+        # L1 CACHE: EXACT MATCH
+        # ==========================================
+        try:
+            exact_data = await request.app.state.redis.hget(redis_key, "response")
+            if exact_data:
+                print("⚡ L1 EXACT CACHE HIT! (0ms)")
+                latency = (time.time() - start_time) * 1000
+                
+                # 🚨 Prometheus Telemetry Update
+                requests_total.labels(routing="L1_CACHE").inc()
+                request_latency_ms.observe(latency)
+                
+                # SQLite Event Log
+                background_tasks.add_task(log_event, client_ip, "cache", "L1", latency, 0, 200, query_class=query_class.value)
+                return json.loads(exact_data)
+        except Exception as e:
+            print(f"⚠️ L1 cache error: {str(e)}")
+        
+
+        # ==========================================
+        # L2 CACHE: SEMANTIC MATCH 
+        # ==========================================
+        try:
+            cached_response = await request.app.state.semantic_cache.search(text_to_embed)
+            if cached_response:
+                latency = (time.time() - start_time) * 1000
+                
+                # 🚨 Prometheus Telemetry Update
+                requests_total.labels(routing="L2_CACHE").inc()
+                request_latency_ms.observe(latency)
+                
+                # SQLite Event Log
+                background_tasks.add_task(log_event, client_ip, "cache", "L2", latency, 0, 200, query_class=query_class.value)
+                return cached_response
+        except Exception as e:
+            print(f"⚠️ L2 Semantic cache error: {str(e)}")
 
     # ==========================================
     # THE FALLBACK LOOP (Network Layer)
@@ -163,21 +173,23 @@ async def proxy(body: dict, request: Request, background_tasks: BackgroundTasks)
         request_latency_ms.observe(latency)
         
         # SQLite Event Log
-        background_tasks.add_task(log_event, client_ip, "failed", "MISS", latency, 0, 502, str(last_exception))
+        background_tasks.add_task(log_event, client_ip, "failed", "MISS", latency, 0, 502, str(last_exception), query_class=query_class.value)
         raise HTTPException(status_code=502, detail=f"All models failed. Last error: {str(last_exception)}")
 
     # ==========================================
     # WRITE TO L1 & L2 CACHE
     # ==========================================
-    try:
-        response_json = json.dumps(final_response.model_dump())
-        await request.app.state.semantic_cache.add(text_to_embed, redis_key, response_json)
-        print("New prompt! Saved to L1 and L2 cache.")
-        
-        # 🚨 Sync the live FAISS size Gauge 
-        faiss_vectors_loaded.set(request.app.state.semantic_cache.index.ntotal)
-    except Exception as e:
-        print(f"⚠️ Failed to save to cache: {str(e)}")
+    if is_cacheable:
+        try:
+            response_json = json.dumps(final_response.model_dump())
+            ttl = DEFAULT_POLICY.ttl_for(query_class)
+            await request.app.state.semantic_cache.add(text_to_embed, redis_key, response_json, ttl=ttl)
+            print(f"New prompt! Saved to L1 and L2 cache (TTL: {ttl}s).")
+            
+            # 🚨 Sync the live FAISS size Gauge 
+            faiss_vectors_loaded.set(request.app.state.semantic_cache.index.ntotal)
+        except Exception as e:
+            print(f"⚠️ Failed to save to cache: {str(e)}")
 
     # ==========================================
     # LOG UPSTREAM SUCCESS
@@ -194,6 +206,6 @@ async def proxy(body: dict, request: Request, background_tasks: BackgroundTasks)
     tokens_consumed.labels(model=successful_model).inc(tokens_used)
     
     # SQLite Event Log
-    background_tasks.add_task(log_event, client_ip, successful_model, "MISS", latency, tokens_used, 200)
+    background_tasks.add_task(log_event, client_ip, successful_model, "MISS", latency, tokens_used, 200, query_class=query_class.value)
 
     return final_response

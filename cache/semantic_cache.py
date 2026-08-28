@@ -73,8 +73,8 @@ class SemanticCache:
         import json
         return json.loads(cached_response)
 
-    async def add(self, prompt: str, redis_key: str, response_json: str):
-        """Embeds prompt, adds to FAISS, backs vector + response to Redis."""
+    async def add(self, prompt: str, redis_key: str, response_json: str, ttl: int = 86400):
+        """Embeds prompt, adds to FAISS, backs vector + response to Redis with dynamic TTL."""
         vector_2d = self._embed(prompt)
 
         # add to in-memory FAISS
@@ -89,5 +89,5 @@ class SemanticCache:
             "response": response_json,
         })
 
-        # keep 24h TTL on the whole hash
-        await self.redis.expire(redis_key, 86400)
+        # use dynamic TTL
+        await self.redis.expire(redis_key, ttl)
